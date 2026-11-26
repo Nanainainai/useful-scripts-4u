@@ -1,4 +1,4 @@
-function kv --description "Save, restore, list, or clear llama-server KV cache slots"
+function kv --description "Save, restore, list, clear, or migrate llama-server KV cache slots"
     set -l base_dir "/mnt/dat/Tools/Artificial Intelligence/kv-slots"
     if set -q KV_DIR; and test -n "$KV_DIR"
         set base_dir "$KV_DIR"
@@ -22,8 +22,11 @@ function kv --description "Save, restore, list, or clear llama-server KV cache s
     end
 
     set -l alias_file "$base_dir/aliases.tsv"
+    set -l perm_manifest "$base_dir/kv_manifest.tsv"
+    set -l tmp_manifest "$tmp_dir/kv_manifest.tsv"
+
     mkdir -p "$base_dir" "$tmp_dir" "$server_save_dir"
-    touch "$alias_file"
+    touch "$alias_file" "$perm_manifest" "$tmp_manifest"
 
     function _kv_print_help
         echo "Usage:"
@@ -31,26 +34,73 @@ function kv --description "Save, restore, list, or clear llama-server KV cache s
         echo "  kv load <pattern|alias|name|rel/path> [-s <slot>] [-u <url>] [-m <model>] [-f] [-p] [-t] [-v] [-h]"
         echo "  kv list [pattern] [-p] [-t] [-v] [-h]"
         echo "  kv clear [pattern1 pattern2 ...] [-s <slot>] [-u <url>] [-e] [-p] [-t] [-v] [-h]"
+        echo "  kv migrate [pattern] [out_pattern] [-p|-t] [-v] [-h]"
         echo ""
         echo "Flags:"
-        echo "  -p, --perm                  Target permanent directory (default for save; combined with -t for list/load)"
-        echo "  -t, --tmp                   Target temporary directory (default for clear; combined with -p for list/load)"
-        echo "  -a, --alias <name>          Assign or update an alias in aliases.tsv"
-        echo "  -s, --slot <id>             Target slot ID (default: 0)"
-        echo "  -u, --url <url>             Target llama-server URL (default: http://127.0.0.1:5001)"
-        echo "  -m, --model <filter>        Select endpoint matching model filter across url and KV_ENDPOINTS"
-        echo "  -f, --force                 Skip compatibility warnings during load"
-        echo "  -e, --erase                 Erase live slot on server during clear"
+        echo "  -p, --perm                     Target permanent directory (save default; migrate destination)"
+        echo "  -t, --tmp                      Target temporary directory (clear default; migrate destination)"
+        echo "  -a, --alias <name>             Assign or update an alias in aliases.tsv"
+        echo "  -s, --slot <id>                Target slot ID (default: 0)"
+        echo "  -u, --url <url>                Target llama-server URL (default: http://127.0.0.1:5001)"
+        echo "  -m, --model <filter>           Select endpoint matching model filter across url and KV_ENDPOINTS"
+        echo "  -f, --force                    Skip compatibility warnings during load"
+        echo "  -e, --erase                    Erase live slot on server during clear"
         echo "  -v, --verbose, --verbose-flag  Print resolved flags, paths, and settings"
-        echo "  -h, --help                  Show this help message"
+        echo "  -h, --help                     Show this help message"
         echo ""
         echo "Defaults & Environment:"
-        echo "  KV_DIR / KV_PERM_DIR        Permanent directory (default: /mnt/dat/Tools/Artificial Intelligence/kv-slots)"
-        echo "  KV_TMP_DIR                  Temporary directory (default: /tmp)"
-        echo "  KV_SERVER_DIR               Server --slot-save-path directory (default: /mnt/dat/kv-slots)"
-        echo "  KV_SERVER_URL               Default server URL (default: http://127.0.0.1:5001)"
-        echo "  KV_ENDPOINTS                Comma- or space-separated extra server URLs for -m lookup"
-        echo "  Wildcards (*, ?, [...])      Supported in load, list, and clear (quote patterns in shell)"
+        echo "  KV_DIR / KV_PERM_DIR           Permanent directory (default: /mnt/dat/Tools/Artificial Intelligence/kv-slots)"
+        echo "  KV_TMP_DIR                     Temporary directory (default: /tmp)"
+        echo "  KV_SERVER_DIR                  Server --slot-save-path directory (default: /mnt/dat/kv-slots)"
+        echo "  KV_SERVER_URL                  Default server URL (default: http://127.0.0.1:5001)"
+        echo "  KV_ENDPOINTS                   Comma- or space-separated extra server URLs for -m lookup"
+        echo "  Wildcards (*, ?, [...])         Supported in load, list, clear, and migrate (quote in shell)"
+    end
+
+    function _kv_register_snapshot --argument-names manifest_file full_path rel_id
+        set -l tmp_m "$manifest_file.tmp"
+        awk -F'\t' -v p="$full_path" '$1 != p {print $0}' "$manifest_file" > "$tmp_m"
+        printf '%s\t%s\n' "$full_path" "$rel_id" >> "$tmp_m"
+        mv -f "$tmp_m" "$manifest_file"
+    end
+
+    function _kv_unregister_snapshot --argument-names manifest_file full_path
+        set -l tmp_m "$manifest_file.tmp"
+        awk -F'\t' -v p="$full_path" '$1 != p {print $0}' "$manifest_file" > "$tmp_m"
+        mv -f "$tmp_m" "$manifest_file"
+    end
+
+    function _kv_update_alias_path --argument-names alias_path old_p new_p
+        set -l tmp_a "$alias_path.tmp"
+        awk -F'\t' -v o="$old_p" -v n="$new_p" 'BEGIN{OFS="\t"} {if ($2 == o) $2 = n; print $1, $2}' "$alias_path" > "$tmp_a"
+        mv -f "$tmp_a" "$alias_path"
+    end
+
+    function _kv_apply_out_pattern --argument-names out_pat src_rel src_base
+        set -l clean_out (string replace -r '^/+' '' -- "$out_pat")
+        if string match -q '*`**' -- "$clean_out"
+            # Handle '*' wildcard replacement using stem or relative path
+            set -l stem (string replace -r '\.bin$' '' -- "$src_base")
+            set -l res (string replace -a '*' "$stem" -- "$clean_out")
+            if not string match -q '*.bin' -- "$res"
+                set res "$res.bin"
+            end
+            echo "$res"
+            return 0
+        end
+        if string match -q '*/' -- "$out_pat"
+            set -l bname (basename "$src_rel")
+            set -l joined "$clean_out$bname"
+            if not string match -q '*.bin' -- "$joined"
+                set joined "$joined.bin"
+            end
+            echo "$joined"
+            return 0
+        end
+        if not string match -q '*.bin' -- "$clean_out"
+            set clean_out "$clean_out.bin"
+        end
+        echo "$clean_out"
     end
 
     if test (count $argv) -lt 1
@@ -198,13 +248,44 @@ function kv --description "Save, restore, list, or clear llama-server KV cache s
         set i (math $i + 1)
     end
 
+    # Collect valid tracked snapshots from each store's manifest
+    set -l perm_entries
+    if test -s "$perm_manifest"
+        set -l kept_perm_m
+        while read -l m_path m_rel
+            if test -n "$m_path"; and test -f "$m_path"
+                if test -z "$m_rel"
+                    set m_rel (string replace -r "^$base_dir/" "" -- "$m_path")
+                end
+                set -a perm_entries "$m_path\t$m_rel"
+                set -a kept_perm_m "$m_path\t$m_rel"
+            end
+        end < "$perm_manifest"
+        printf '%s\n' $kept_perm_m > "$perm_manifest"
+    end
+
+    set -l tmp_entries
+    if test -s "$tmp_manifest"
+        set -l kept_tmp_m
+        while read -l m_path m_rel
+            if test -n "$m_path"; and test -f "$m_path"
+                if test -z "$m_rel"
+                    set m_rel (basename "$m_path")
+                end
+                set -a tmp_entries "$m_path\t$m_rel"
+                set -a kept_tmp_m "$m_path\t$m_rel"
+            end
+        end < "$tmp_manifest"
+        printf '%s\n' $kept_tmp_m > "$tmp_manifest"
+    end
+
     if test $use_perm -eq 0 -a $use_tmp -eq 0
         switch $subcmd
             case save
                 set use_perm 1
             case clear
                 set use_tmp 1
-            case list load restore
+            case list load restore migrate
                 set use_perm 1
                 set use_tmp 1
         end
@@ -294,11 +375,12 @@ except Exception:
                 end
 
                 echo ""
-                echo "=== Permanent Slot Directory ($base_dir) ==="
-                set -l slot_files (find "$base_dir" -type f -name '*.bin' | sort)
+                echo "=== Permanent KV Snapshots ($base_dir) ==="
                 set -l printed_perm 0
-                for f in $slot_files
-                    set -l rel (string replace -r "^$base_dir/" "" -- "$f")
+                for entry in $perm_entries
+                    set -l parts (string split -m 1 \t -- "$entry")
+                    set -l f $parts[1]
+                    set -l rel $parts[2]
                     set -l no_ext (string replace -r '\.bin$' '' -- "$rel")
                     if test -n "$filter_pat"
                         if not string match -q "$filter_pat" -- "$rel"; and not string match -q "$filter_pat" -- "$no_ext"
@@ -315,7 +397,7 @@ except Exception:
                     set printed_perm 1
                 end
                 if test $printed_perm -eq 0
-                    echo "  (no matching .bin files)"
+                    echo "  (no tracked .bin snapshots)"
                 end
             end
 
@@ -323,11 +405,12 @@ except Exception:
                 if test $use_perm -eq 1
                     echo ""
                 end
-                echo "=== Temp Snapshots ($tmp_dir) ==="
-                set -l tmp_files (find "$tmp_dir" -maxdepth 3 -type f -name '*.bin' 2>/dev/null | sort)
+                echo "=== Temp KV Snapshots ($tmp_dir) ==="
                 set -l printed_tmp 0
-                for f in $tmp_files
-                    set -l rel (string replace -r "^$tmp_dir/" "" -- "$f")
+                for entry in $tmp_entries
+                    set -l parts (string split -m 1 \t -- "$entry")
+                    set -l f $parts[1]
+                    set -l rel $parts[2]
                     set -l no_ext (string replace -r '\.bin$' '' -- "$rel")
                     if test -n "$filter_pat"
                         if not string match -q "$filter_pat" -- "$rel"; and not string match -q "$filter_pat" -- "$no_ext"
@@ -344,7 +427,7 @@ except Exception:
                     set printed_tmp 1
                 end
                 if test $printed_tmp -eq 0
-                    echo "  (no matching .bin files in $tmp_dir)"
+                    echo "  (no tracked .bin snapshots in $tmp_dir)"
                 end
             end
 
@@ -427,18 +510,22 @@ print(f"n_tokens\t{n_tokens}")
                     mv -f "$stage_full" "$tmp_path"
                     printf '%s\n' $meta_lines > "$perm_path.meta"
                     printf '%s\n' $meta_lines > "$tmp_path.meta"
+                    _kv_register_snapshot "$perm_manifest" "$perm_path" "$clean_rel"
+                    _kv_register_snapshot "$tmp_manifest" "$tmp_path" "$flat_name"
                     echo "Saved KV cache (slot $slot_id) -> $perm_path"
                     echo "Saved KV cache (slot $slot_id) -> $tmp_path"
                     set primary_path "$perm_path"
                 else
                     mv -f "$stage_full" "$perm_path"
                     printf '%s\n' $meta_lines > "$perm_path.meta"
+                    _kv_register_snapshot "$perm_manifest" "$perm_path" "$clean_rel"
                     echo "Saved KV cache (slot $slot_id) -> $perm_path"
                     set primary_path "$perm_path"
                 end
             else if test $use_tmp -eq 1
                 mv -f "$stage_full" "$tmp_path"
                 printf '%s\n' $meta_lines > "$tmp_path.meta"
+                _kv_register_snapshot "$tmp_manifest" "$tmp_path" "$flat_name"
                 echo "Saved KV cache (slot $slot_id) -> $tmp_path"
                 set primary_path "$tmp_path"
             end
@@ -459,28 +546,41 @@ print(f"n_tokens\t{n_tokens}")
 
             set -l pat $targets[1]
             set -l clean_pat (string replace -r '^/+' '' -- "$pat")
+            set -l flat_pat (string replace -a '/' '_' -- "$clean_pat")
             set -l matches
 
+            # 1. Check matching aliases pointing to tracked snapshots
             if test -s "$alias_file"
                 while read -l a_name a_path
-                    if test -z "$a_name"; or test -z "$a_path"
+                    if test -z "$a_name"; or test -z "$a_path"; or not test -f "$a_path"
                         continue
                     end
-                    if string match -q "$pat" -- "$a_name"; and test -f "$a_path"
+                    if string match -q "$pat" -- "$a_name"
                         set -l in_perm (string match -q "$base_dir/*" -- "$a_path"; and echo 1; or echo 0)
                         set -l in_tmp (string match -q "$tmp_dir/*" -- "$a_path"; and echo 1; or echo 0)
-                        if test \( $use_perm -eq 1 -a $in_perm -eq 1 \) -o \( $use_tmp -eq 1 -a $in_tmp -eq 1 \) -o \( $in_perm -eq 0 -a $in_tmp -eq 0 \)
-                            if not contains -- "$a_path" $matches
-                                set -a matches "$a_path"
+                        set -l tracked_ok 0
+                        if test $in_perm -eq 1; and grep -Fxq -- "$a_path" (for e in $perm_entries; string split -m 1 \t -- "$e" | head -n 1; end) 2>/dev/null
+                            set tracked_ok 1
+                        end
+                        if test $in_tmp -eq 1; and grep -Fxq -- "$a_path" (for e in $tmp_entries; string split -m 1 \t -- "$e" | head -n 1; end) 2>/dev/null
+                            set tracked_ok 1
+                        end
+                        if test $tracked_ok -eq 1
+                            if test \( $use_perm -eq 1 -a $in_perm -eq 1 \) -o \( $use_tmp -eq 1 -a $in_tmp -eq 1 \)
+                                if not contains -- "$a_path" $matches
+                                    set -a matches "$a_path"
+                                end
                             end
                         end
                     end
                 end < "$alias_file"
             end
 
+            # 2. Match tracked temp snapshots
             if test $use_tmp -eq 1
-                set -l flat_pat (string replace -a '/' '_' -- "$clean_pat")
-                for f in (find "$tmp_dir" -maxdepth 3 -type f -name '*.bin' 2>/dev/null | sort)
+                for entry in $tmp_entries
+                    set -l parts (string split -m 1 \t -- "$entry")
+                    set -l f $parts[1]
                     set -l bname (basename "$f")
                     set -l bname_no_ext (string replace -r '\.bin$' '' -- "$bname")
                     if string match -q "$clean_pat" -- "$bname"; or string match -q "$clean_pat.bin" -- "$bname"; or string match -q "$clean_pat" -- "$bname_no_ext"; or string match -q "$flat_pat" -- "$bname"; or string match -q "$flat_pat.bin" -- "$bname"
@@ -491,9 +591,12 @@ print(f"n_tokens\t{n_tokens}")
                 end
             end
 
+            # 3. Match tracked permanent snapshots
             if test $use_perm -eq 1
-                for f in (find "$base_dir" -type f -name '*.bin' 2>/dev/null | sort)
-                    set -l rel (string replace -r "^$base_dir/" "" -- "$f")
+                for entry in $perm_entries
+                    set -l parts (string split -m 1 \t -- "$entry")
+                    set -l f $parts[1]
+                    set -l rel $parts[2]
                     set -l rel_no_ext (string replace -r '\.bin$' '' -- "$rel")
                     set -l bname (basename "$f")
                     set -l bname_no_ext (string replace -r '\.bin$' '' -- "$bname")
@@ -506,7 +609,7 @@ print(f"n_tokens\t{n_tokens}")
             end
 
             if test (count $matches) -eq 0
-                echo "No KV cache file matched '$pat'" >&2
+                echo "No tracked KV cache snapshot matched '$pat'" >&2
                 return 1
             end
 
@@ -620,6 +723,130 @@ print(f"n_ctx={n_ctx}")
 
             echo "Restored KV cache (slot $slot_id @ $target_url) <- $src_path"
 
+        case migrate
+            # Determine migration direction:
+            # explicit_dir: 0 = opposite store per item, 1 = destination is perm, 2 = destination is tmp
+            set -l explicit_dir 0
+            set -l has_p_flag 0
+            set -l has_t_flag 0
+            for raw_arg in $argv[2..-1]
+                if test "$raw_arg" = "-p" -o "$raw_arg" = "--perm"
+                    set has_p_flag 1
+                else if test "$raw_arg" = "-t" -o "$raw_arg" = "--tmp"
+                    set has_t_flag 1
+                else if string match -r '^-[^-]*p' -- "$raw_arg"
+                    set has_p_flag 1
+                else if string match -r '^-[^-]*t' -- "$raw_arg"
+                    set has_t_flag 1
+                end
+            end
+
+            if test $has_p_flag -eq 1 -a $has_t_flag -eq 0
+                set explicit_dir 1
+            else if test $has_t_flag -eq 1 -a $has_p_flag -eq 0
+                set explicit_dir 2
+            end
+
+            set -l pat ""
+            set -l out_pat ""
+            if test (count $targets) -ge 1
+                set pat $targets[1]
+            end
+            if test (count $targets) -ge 2
+                set out_pat $targets[2]
+            end
+
+            # Build candidate list: store_tag\tf\trel
+            set -l candidates
+            for entry in $perm_entries
+                set -l parts (string split -m 1 \t -- "$entry")
+                set -a candidates "perm\t$parts[1]\t$parts[2]"
+            end
+            for entry in $tmp_entries
+                set -l parts (string split -m 1 \t -- "$entry")
+                set -a candidates "tmp\t$parts[1]\t$parts[2]"
+            end
+
+            set -l migrated_count 0
+            for cand in $candidates
+                set -l cols (string split -m 2 \t -- "$cand")
+                set -l store $cols[1]
+                set -l src_f $cols[2]
+                set -l src_rel $cols[3]
+                set -l bname (basename "$src_f")
+                set -l bname_no_ext (string replace -r '\.bin$' '' -- "$bname")
+                set -l rel_no_ext (string replace -r '\.bin$' '' -- "$src_rel")
+                set -l rel_dir (dirname "$src_rel")
+
+                if test -n "$pat"
+                    set -l clean_pat (string replace -r '^/+' '' -- "$pat")
+                    set -l flat_pat (string replace -a '/' '_' -- "$clean_pat")
+                    if not string match -q "$clean_pat" -- "$src_rel"; and not string match -q "$clean_pat.bin" -- "$src_rel"; and not string match -q "$clean_pat" -- "$rel_no_ext"; and not string match -q "$clean_pat" -- "$rel_dir"; and not string match -q "$clean_pat" -- "$bname"; and not string match -q "$clean_pat" -- "$bname_no_ext"; and not string match -q "$flat_pat" -- "$bname"
+                        continue
+                    end
+                end
+
+                set -l dest_store ""
+                if test $explicit_dir -eq 1
+                    set dest_store "perm"
+                else if test $explicit_dir -eq 2
+                    set dest_store "tmp"
+                else
+                    if test "$store" = "perm"
+                        set dest_store "tmp"
+                    else
+                        set dest_store "perm"
+                    end
+                end
+
+                if test "$store" = "$dest_store"
+                    continue
+                end
+
+                set -l dest_rel "$src_rel"
+                if test -n "$out_pat"
+                    set dest_rel (_kv_apply_out_pattern "$out_pat" "$src_rel" "$bname")
+                end
+
+                set -l dest_f ""
+                set -l dest_manifest ""
+                set -l src_manifest ""
+                if test "$dest_store" = "perm"
+                    set -l clean_d (string replace -r '^/+' '' -- "$dest_rel")
+                    set dest_f "$base_dir/$clean_d"
+                    set dest_manifest "$perm_manifest"
+                    set src_manifest "$tmp_manifest"
+                    set dest_rel "$clean_d"
+                else
+                    set -l flat_d (string replace -a '/' '_' -- (string replace -r '^/+' '' -- "$dest_rel"))
+                    set dest_f "$tmp_dir/$flat_d"
+                    set dest_manifest "$tmp_manifest"
+                    set src_manifest "$perm_manifest"
+                    set dest_rel "$flat_d"
+                end
+
+                mkdir -p (dirname "$dest_f")
+                mv -f "$src_f" "$dest_f"
+                if test -f "$src_f.meta"
+                    mv -f "$src_f.meta" "$dest_f.meta"
+                end
+
+                _kv_unregister_snapshot "$src_manifest" "$src_f"
+                _kv_register_snapshot "$dest_manifest" "$dest_f" "$dest_rel"
+                _kv_update_alias_path "$alias_file" "$src_f" "$dest_f"
+
+                if test "$store" = "perm"
+                    find "$base_dir" -mindepth 1 -type d -empty -delete 2>/dev/null
+                end
+
+                echo "Migrated ($store -> $dest_store): $src_f -> $dest_f"
+                set migrated_count (math $migrated_count + 1)
+            end
+
+            if test $migrated_count -eq 0
+                echo "No tracked snapshots migrated."
+            end
+
         case clear
             if test $erase_slot -eq 1
                 curl -sf -X POST "$target_url/slots/$slot_id?action=erase" > /dev/null
@@ -628,14 +855,22 @@ print(f"n_ctx={n_ctx}")
 
             if test (count $targets) -eq 0
                 if test $use_tmp -eq 1
-                    find "$tmp_dir" -maxdepth 3 -type f \( -name '*.bin' -o -name '*.bin.meta' \) -delete 2>/dev/null
-                    echo "Cleared temp KV caches in $tmp_dir"
+                    for entry in $tmp_entries
+                        set -l f (string split -m 1 \t -- "$entry")[1]
+                        rm -f "$f" "$f.meta"
+                    end
+                    : > "$tmp_manifest"
+                    echo "Cleared tracked temp KV caches in $tmp_dir"
                 end
                 if test $use_perm -eq 1
-                    find "$base_dir" -type f \( -name '*.bin' -o -name '*.bin.meta' \) -delete
+                    for entry in $perm_entries
+                        set -l f (string split -m 1 \t -- "$entry")[1]
+                        rm -f "$f" "$f.meta"
+                    end
                     find "$base_dir" -mindepth 1 -type d -empty -delete 2>/dev/null
+                    : > "$perm_manifest"
                     : > "$alias_file"
-                    echo "Cleared permanent KV caches in $base_dir"
+                    echo "Cleared tracked permanent KV caches in $base_dir"
                 end
             else
                 for pat in $targets
@@ -654,8 +889,14 @@ print(f"n_ctx={n_ctx}")
                                 if test \( $use_perm -eq 1 -a $in_perm -eq 1 \) -o \( $use_tmp -eq 1 -a $in_tmp -eq 1 \)
                                     if test -e "$a_path"
                                         rm -rf "$a_path" "$a_path.meta"
-                                        echo "Removed $a_path"
                                     end
+                                    if test $in_perm -eq 1
+                                        _kv_unregister_snapshot "$perm_manifest" "$a_path"
+                                    end
+                                    if test $in_tmp -eq 1
+                                        _kv_unregister_snapshot "$tmp_manifest" "$a_path"
+                                    end
+                                    echo "Removed $a_path"
                                     continue
                                 end
                             end
@@ -665,25 +906,30 @@ print(f"n_ctx={n_ctx}")
                     end
 
                     if test $use_tmp -eq 1
-                        for f in (find "$tmp_dir" -maxdepth 3 -type f -name '*.bin' 2>/dev/null)
+                        for entry in $tmp_entries
+                            set -l f (string split -m 1 \t -- "$entry")[1]
                             set -l bname (basename "$f")
                             set -l bname_no_ext (string replace -r '\.bin$' '' -- "$bname")
                             if string match -q "$clean_pat" -- "$bname"; or string match -q "$clean_pat.bin" -- "$bname"; or string match -q "$clean_pat" -- "$bname_no_ext"; or string match -q "$flat_pat" -- "$bname"; or string match -q "$flat_pat.bin" -- "$bname"
                                 rm -f "$f" "$f.meta"
+                                _kv_unregister_snapshot "$tmp_manifest" "$f"
                                 echo "Removed $f"
                             end
                         end
                     end
 
                     if test $use_perm -eq 1
-                        for f in (find "$base_dir" -type f -name '*.bin' 2>/dev/null)
-                            set -l rel (string replace -r "^$base_dir/" "" -- "$f")
+                        for entry in $perm_entries
+                            set -l cols (string split -m 2 \t -- "$entry")
+                            set -l f $cols[1]
+                            set -l rel $cols[2]
                             set -l rel_no_ext (string replace -r '\.bin$' '' -- "$rel")
                             set -l rel_dir (dirname "$rel")
                             set -l bname (basename "$f")
                             set -l bname_no_ext (string replace -r '\.bin$' '' -- "$bname")
                             if string match -q "$clean_pat" -- "$rel"; or string match -q "$clean_pat.bin" -- "$rel"; or string match -q "$clean_pat" -- "$rel_no_ext"; or string match -q "$clean_pat" -- "$rel_dir"; or string match -q "$clean_pat" -- "$bname"; or string match -q "$clean_pat" -- "$bname_no_ext"
                                 rm -f "$f" "$f.meta"
+                                _kv_unregister_snapshot "$perm_manifest" "$f"
                                 echo "Removed $f"
                             end
                         end
@@ -693,7 +939,7 @@ print(f"n_ctx={n_ctx}")
             end
 
         case '*'
-            echo "Unknown subcommand: $subcmd (use 'save', 'load', 'list', or 'clear')" >&2
+            echo "Unknown subcommand: $subcmd (use 'save', 'load', 'list', 'clear', or 'migrate')" >&2
             return 1
     end
 end
